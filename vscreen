@@ -85,6 +85,7 @@ cmd_install() {
         x11-xserver-utils \
         x11-utils \
         pciutils \
+        mesa-utils \
         2>/dev/null
     success "Packages installed"
 
@@ -661,20 +662,27 @@ cmd_gpu() {
 
     echo ""
 
-    # OpenGL check via glxinfo if available
-    if command -v glxinfo &>/dev/null && systemctl is-active --quiet vscreen-display 2>/dev/null; then
+    # OpenGL renderer check via glxinfo
+    if ! command -v glxinfo &>/dev/null; then
+        warn "glxinfo not found — run: sudo apt install mesa-utils" >&2
+    elif ! systemctl is-active --quiet vscreen-display 2>/dev/null; then
+        echo "  (Run 'sudo vscreen start' then 'sudo vscreen gpu' to verify OpenGL renderer)"
+    else
         local renderer
         renderer=$(DISPLAY="$DISPLAY_NUM" glxinfo 2>/dev/null | grep "OpenGL renderer" | cut -d: -f2 | xargs)
         if [[ -n "$renderer" ]]; then
             echo -e "  OpenGL:      ${renderer}"
             if echo "$renderer" | grep -qi "nvidia"; then
-                echo -e "  ${GREEN}✓${RESET}  Hardware OpenGL confirmed"
+                echo -e "  ${GREEN}✓${RESET}  Hardware OpenGL confirmed — full GPU acceleration active"
             else
-                echo -e "  ${YELLOW}⚠${RESET}  OpenGL renderer is not NVIDIA — check your xorg.conf"
+                echo -e "  ${YELLOW}⚠${RESET}  OpenGL renderer is not NVIDIA (got: ${renderer})"
+                echo    "     This means apps are using software rendering despite the GPU being present."
+                echo    "     Check Xorg log: sudo journalctl -u vscreen-display -n 50"
             fi
+        else
+            echo -e "  ${YELLOW}⚠${RESET}  glxinfo returned no renderer — Xorg may not be using the GPU yet"
+            echo    "     Check: sudo journalctl -u vscreen-display -n 50"
         fi
-    else
-        echo "  (Start vscreen to check OpenGL renderer: sudo vscreen start)"
     fi
 
     echo ""
