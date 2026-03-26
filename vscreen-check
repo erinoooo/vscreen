@@ -71,6 +71,30 @@ else
     (( WARNINGS++ )) || true
 fi
 
+# ── GPU ──────────────────────────────────────────────────────────────────────
+section "GPU"
+if command -v lspci &>/dev/null; then
+    if lspci 2>/dev/null | grep -qi "nvidia"; then
+        if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
+            gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+            ok "NVIDIA GPU: ${gpu_name} — drivers working"
+            ok "vscreen will use full GPU acceleration"
+        elif command -v nvidia-smi &>/dev/null; then
+            fail "NVIDIA GPU found but nvidia-smi failed — drivers may be broken"
+            echo "       Fix: sudo modprobe nvidia  or  sudo ubuntu-drivers autoinstall && sudo reboot"
+        else
+            fail "NVIDIA GPU found but drivers not installed"
+            echo "       Fix: sudo ubuntu-drivers autoinstall && sudo reboot"
+        fi
+    else
+        warn "No NVIDIA GPU detected — vscreen will use software dummy driver (no GPU acceleration)"
+        (( WARNINGS++ )) || true
+    fi
+else
+    warn "pciutils not installed — cannot detect GPU (vscreen install will install it)"
+    (( WARNINGS++ )) || true
+fi
+
 # ── Display stack ─────────────────────────────────────────────────────────────
 section "Display"
 if command -v Xorg &>/dev/null; then
