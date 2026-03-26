@@ -22,22 +22,29 @@ echo -e "${BOLD}vscreen — installer${RESET}"
 echo -e "  github.com/${REPO}"
 echo ""
 
+# ── Root check ────────────────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || die "Run with sudo:  curl -fsSL ${RAW}/install.sh | sudo bash"
 
+# ── OS check (warn, never die) ───────────────────────────────────────────────
 if ! grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
     warn "Not Ubuntu — vscreen is tested on 22.04/24.04. Continuing anyway."
 fi
 
+# ── Dependencies ──────────────────────────────────────────────────────────────
 if ! command -v curl &>/dev/null; then
     info "Installing curl..."
-    apt-get install -y -qq curl
+    apt-get install -y -qq curl 2>/dev/null || die "Failed to install curl"
 fi
 
+# ── Download vscreen ──────────────────────────────────────────────────────────
 info "Downloading vscreen..."
-curl -fsSL "${RAW}/vscreen" -o "$BIN"
+if ! curl -fsSL "${RAW}/vscreen" -o "$BIN"; then
+    die "Failed to download vscreen. Check your internet connection."
+fi
 chmod +x "$BIN"
 success "Downloaded to ${BIN}"
 
+# ── Run install ───────────────────────────────────────────────────────────────
 echo ""
 vscreen install
 

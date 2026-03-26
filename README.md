@@ -26,6 +26,7 @@ sudo vscreen start
 
 ```
 → Starting virtual display...
+→ Waiting for display to be ready...
 → Starting XFCE4 desktop...
 → Starting VNC server...
 
@@ -42,12 +43,13 @@ vscreen is running.
 ## How it works
 
 ```
-Xorg (dummy driver)
+Xorg (dummy driver or NVIDIA)
   └─ virtual display at DISPLAY=:1
   └─ spoofed EDID: Dell P2419H, 1920x1080@60Hz
   └─ kernel sees it as a real connected monitor
 
 XFCE4 desktop session
+  └─ runs as dedicated 'vscreen' user (not root)
   └─ full DE: taskbar, file manager, terminal, app menu
 
 x11vnc
@@ -70,6 +72,9 @@ sudo vscreen status                 # show services + connection info
 sudo vscreen password               # set or change VNC password
 sudo vscreen resolution 2560x1440   # change resolution
 sudo vscreen port 5901              # change VNC port
+sudo vscreen gpu                    # show GPU info and acceleration status
+sudo vscreen logs                   # show recent logs (all services)
+sudo vscreen logs vnc 50            # show last 50 lines of VNC logs
 sudo vscreen uninstall              # remove everything
 ```
 
@@ -89,7 +94,7 @@ sudo vscreen uninstall              # remove everything
 
 ## Requirements
 
-- **Ubuntu 22.04 or 24.04**
+- **Ubuntu 22.04 or 24.04** (other distros may work but are untested)
 - Port **5900** open inbound on your server's firewall
 
 ### Opening port 5900
@@ -104,7 +109,23 @@ sudo vscreen uninstall              # remove everything
 
 ---
 
+## NVIDIA GPU support
+
+If your server has an NVIDIA GPU with working drivers, vscreen automatically detects it and uses hardware-accelerated rendering. No extra configuration needed.
+
+If the GPU is present but drivers aren't installed, vscreen falls back gracefully to the software dummy driver and tells you how to install drivers.
+
+Check GPU status any time:
+
+```bash
+sudo vscreen gpu
+```
+
+---
+
 ## Security
+
+The desktop session runs as a dedicated `vscreen` user (not root), limiting the blast radius if anything goes wrong.
 
 VNC is password protected out of the box. For stronger security, tunnel over SSH instead of opening port 5900 publicly:
 
@@ -113,6 +134,25 @@ ssh -L 5900:localhost:5900 user@your-server
 ```
 
 Then connect your VNC client to `localhost:5900`. Port 5900 never needs to be open on the firewall.
+
+---
+
+## Troubleshooting
+
+Check service status:
+
+```bash
+sudo vscreen status     # shows which services are up/down with recent errors
+sudo vscreen logs       # show all recent logs
+sudo vscreen logs vnc   # show VNC server logs specifically
+```
+
+Common issues:
+
+- **Display won't start:** Check `sudo vscreen logs display` — usually a missing package or Xorg config issue.
+- **Desktop starts but VNC won't connect:** Make sure port 5900 is open. Check `sudo vscreen logs vnc`.
+- **Black screen in VNC:** The desktop may still be starting. Wait a few seconds and reconnect.
+- **Resolution change didn't work:** Run `sudo vscreen restart` to apply.
 
 ---
 
@@ -128,3 +168,4 @@ vscreen uses the `dummy` Xorg driver with a spoofed EDID that tells the system a
 | EDID | None | Spoofed (Dell P2419H) |
 | Apps detect headless | Sometimes | No |
 | Setup | Manual | One command |
+| Desktop runs as | root | dedicated user |

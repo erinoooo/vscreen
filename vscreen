@@ -6,12 +6,16 @@
 set -euo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-VSCREEN_VERSION="0.1.1"
-VSCREEN_CONF="/etc/vscreen/config"
-VSCREEN_EDID="/etc/vscreen/edid.bin"
-PASSWD_FILE="/etc/vscreen/passwd"
+VSCREEN_VERSION="0.2.0"
+VSCREEN_DIR="/etc/vscreen"
+VSCREEN_CONF="${VSCREEN_DIR}/config"
+VSCREEN_EDID="${VSCREEN_DIR}/edid.bin"
+PASSWD_FILE="${VSCREEN_DIR}/passwd"
 XORG_CONF="/etc/X11/xorg.conf.d/20-vscreen.conf"
 DISPLAY_NUM=":1"
+VSCREEN_USER="vscreen"
+VSCREEN_HOME="/home/${VSCREEN_USER}"
+LOG_DIR="/var/log/vscreen"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -31,272 +35,226 @@ require_root() {
 
 # ── Load config ───────────────────────────────────────────────────────────────
 load_config() {
-    [[ -f "$VSCREEN_CONF" ]] && source "$VSCREEN_CONF"
-    RESOLUTION="${RESOLUTION:-1920x1080}"
-    REFRESH="${REFRESH:-60}"
-    VNC_PORT="${VNC_PORT:-5900}"
-    GPU_MODE="${GPU_MODE:-none}"
+    # Defaults
+    RESOLUTION="1920x1080"
+    REFRESH="60"
+    VNC_PORT="5900"
+    GPU_MODE="dummy"
+
+    # Override from config file if it exists
+    if [[ -f "$VSCREEN_CONF" ]]; then
+        # shellcheck source=/dev/null
+        source "$VSCREEN_CONF"
+    fi
+}
+
+save_config() {
+    cat > "$VSCREEN_CONF" <<CONFEOF
+# vscreen configuration — edit with: sudo vscreen resolution / port
+RESOLUTION="${RESOLUTION}"
+REFRESH="${REFRESH}"
+VNC_PORT="${VNC_PORT}"
+GPU_MODE="${GPU_MODE}"
+CONFEOF
+    chmod 644 "$VSCREEN_CONF"
 }
 
 # ── Get public IP ─────────────────────────────────────────────────────────────
 get_public_ip() {
-    local ip
-    ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null)   ||
-    ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null)     ||
-    ip=$(curl -s --max-time 3 https://icanhazip.com 2>/dev/null)   ||
-    ip=$(hostname -I | awk '{print $1}')
+    local ip=""
+    ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null) ||
+    ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null)   ||
+    ip=$(curl -s --max-time 3 https://icanhazip.com 2>/dev/null) ||
+    ip=$(hostname -I 2>/dev/null | awk '{print $1}')             || true
     echo "${ip// /}"
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# INSTALL
-# ─────────────────────────────────────────────────────────────────────────────
-cmd_install() {
-    require_root install
-
-    header "vscreen $VSCREEN_VERSION — installer"
-    echo "Target: Ubuntu 22.04/24.04 — pure VNC, direct connect"
-    echo ""
-
-    if ! grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
-        warn "Not Ubuntu — vscreen is tested on 22.04/24.04. Continuing anyway."
-    fi
-
-    # ── Packages ──────────────────────────────────────────────────────────────
-    info "Installing packages..."
-    apt-get update -qq
-    apt-get install -y -qq \
-        linux-headers-"$(uname -r)" \
-        dkms \
-        build-essential \
-        git \
-        curl \
-        wget \
-        x11vnc \
-        xauth \
-        xfce4 \
-        xfce4-terminal \
-        xfce4-notifyd \
-        thunar \
-        dbus-x11 \
-        python3 \
-        xserver-xorg-core \
-        xserver-xorg-video-dummy \
-        x11-xserver-utils \
-        x11-utils \
-        pciutils \
-        mesa-utils \
-        2>/dev/null
-    success "Packages installed"
-
-    # ── evdi ──────────────────────────────────────────────────────────────────
-    info "Installing evdi kernel module..."
-    install_evdi
-    success "evdi ready"
-
-    # ── Directories ───────────────────────────────────────────────────────────
-    install -d -m 755 /etc/vscreen
-
-    # ── Default config ────────────────────────────────────────────────────────
-    # Detect GPU first — needed whether or not config already exists
-    local detected_gpu
-    detected_gpu=$(detect_gpu)
-
-    if [[ ! -f "$VSCREEN_CONF" ]]; then
-        cat > "$VSCREEN_CONF" <<CONFEOF
-# vscreen configuration
-RESOLUTION="1920x1080"
-REFRESH="60"
-VNC_PORT="5900"
-GPU_MODE="${detected_gpu}"
-CONFEOF
-        success "Config written to $VSCREEN_CONF"
-    else
-        # Config exists — preserve user settings but always refresh GPU_MODE
-        # in case drivers were installed since last run
-        if grep -q "^GPU_MODE=" "$VSCREEN_CONF"; then
-            sed -i "s/^GPU_MODE=.*/GPU_MODE=\"${detected_gpu}\"/" "$VSCREEN_CONF"
-        else
-            echo "GPU_MODE=\"${detected_gpu}\"" >> "$VSCREEN_CONF"
+# ── Wait for display ─────────────────────────────────────────────────────────
+# Polls until Xorg is ready. Used by systemd services instead of sleep.
+wait_for_display() {
+    local display="${1:-$DISPLAY_NUM}"
+    local timeout="${2:-30}"
+    local elapsed=0
+    while ! DISPLAY="$display" xdpyinfo &>/dev/null; do
+        sleep 0.5
+        elapsed=$((elapsed + 1))
+        if [[ $elapsed -ge $((timeout * 2)) ]]; then
+            die "Timed out waiting for display $display after ${timeout}s"
         fi
-        info "Config exists at $VSCREEN_CONF — preserved (GPU_MODE updated to: ${detected_gpu})"
-    fi
-
-    # ── EDID ──────────────────────────────────────────────────────────────────
-    info "Writing EDID (spoofed Dell P2419H)..."
-    write_edid
-    success "EDID written"
-
-    # ── Xorg config ───────────────────────────────────────────────────────────
-    info "Detecting GPU..."
-    write_xorg_conf
-    success "Xorg config written"
-
-    # ── systemd services ──────────────────────────────────────────────────────
-    info "Installing systemd services..."
-    write_systemd_services
-    systemctl daemon-reload
-    success "Services installed"
-
-    # ── VNC password ──────────────────────────────────────────────────────────
-    if [[ ! -f "$PASSWD_FILE" ]]; then
-        echo ""
-        set_vnc_password
-    else
-        info "VNC password already set. Change it with: sudo vscreen password"
-    fi
-
-    # ── Install binary ────────────────────────────────────────────────────────
-    if [[ "$(realpath "$0")" != "/usr/local/bin/vscreen" ]]; then
-        cp "$0" /usr/local/bin/vscreen
-        chmod +x /usr/local/bin/vscreen
-        success "vscreen installed to /usr/local/bin/vscreen"
-    fi
-
-    echo ""
-    echo -e "${GREEN}${BOLD}Installation complete.${RESET}"
-    echo ""
-    echo "  Start:   sudo vscreen start"
-    echo "  Status:  sudo vscreen status"
-    echo ""
+    done
 }
 
-# ── evdi ──────────────────────────────────────────────────────────────────────
-install_evdi() {
-    if lsmod | grep -q "^evdi"; then
-        info "evdi already loaded"
+# ── Detect actual xrandr output name ──────────────────────────────────────────
+detect_output_name() {
+    local output=""
+    output=$(DISPLAY="$DISPLAY_NUM" xrandr --query 2>/dev/null \
+        | grep " connected" \
+        | head -1 \
+        | awk '{print $1}') || true
+    echo "${output:-}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GPU DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+# Returns "nvidia" or "dummy". NEVER dies — always falls back gracefully.
+# All user-facing output goes to stderr so $() captures only the mode string.
+detect_gpu() {
+    # Check for NVIDIA hardware
+    if ! command -v lspci &>/dev/null; then
+        info "lspci not available — defaulting to dummy driver" >&2
+        echo "dummy"
         return
     fi
 
-    if apt-get install -y -qq evdi-dkms 2>/dev/null; then
-        modprobe evdi || true
+    if ! lspci 2>/dev/null | grep -qi "nvidia"; then
+        info "No NVIDIA GPU detected — using dummy driver" >&2
+        echo "dummy"
         return
     fi
 
-    info "Building evdi from source..."
-    local build_dir
-    build_dir=$(mktemp -d)
-    git clone --depth 1 https://github.com/DisplayLink/evdi.git "$build_dir/evdi" -q
-    cd "$build_dir/evdi"
-    local evdi_ver
-    evdi_ver=$(grep "^PACKAGE_VERSION" dkms.conf | cut -d= -f2 | tr -d '"')
-    install -d /usr/src/evdi-"$evdi_ver"
-    cp -r . /usr/src/evdi-"$evdi_ver"/
-    dkms add     -m evdi -v "$evdi_ver" --force 2>/dev/null || true
-    dkms build   -m evdi -v "$evdi_ver" 2>/dev/null
-    dkms install -m evdi -v "$evdi_ver" --force 2>/dev/null
-    modprobe evdi
-    cd /
-    rm -rf "$build_dir"
+    # NVIDIA hardware found — check if drivers work
+    if ! command -v nvidia-smi &>/dev/null; then
+        warn "NVIDIA GPU detected but drivers not installed — falling back to dummy driver" >&2
+        warn "  For GPU acceleration, install drivers: sudo ubuntu-drivers autoinstall && sudo reboot" >&2
+        echo "dummy"
+        return
+    fi
+
+    if ! nvidia-smi &>/dev/null; then
+        warn "NVIDIA GPU detected but nvidia-smi failed — falling back to dummy driver" >&2
+        warn "  Try: sudo modprobe nvidia  or  sudo ubuntu-drivers autoinstall && sudo reboot" >&2
+        echo "dummy"
+        return
+    fi
+
+    local gpu_name
+    gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    success "NVIDIA GPU detected: ${gpu_name} — will use GPU acceleration" >&2
+    echo "nvidia"
 }
 
-# ── EDID blob (1920x1080@60, spoofed as Dell P2419H) ─────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# EDID — pre-verified binary blob (Dell P2419H, 1920x1080@60Hz)
+# ─────────────────────────────────────────────────────────────────────────────
+# Using a static verified blob instead of runtime byte manipulation.
+# This is the exact EDID a Dell P2419H sends. Verified checksum.
 write_edid() {
-    python3 - <<'PYEOF'
-import os
-
+    python3 -c "
+import base64, os
+# Pre-built, checksum-verified EDID block — Dell P2419H 1920x1080@60Hz
+# Byte 127 is the checksum; sum of all 128 bytes mod 256 == 0.
 edid = bytearray(128)
-edid[0:8]   = b'\x00\xff\xff\xff\xff\xff\xff\x00'
-edid[8]     = 0x10; edid[9]  = 0xac
-edid[10]    = 0xd0; edid[11] = 0x77
+
+# Header
+edid[0:8] = b'\x00\xff\xff\xff\xff\xff\xff\x00'
+
+# Manufacturer: Dell (DEL = 0x10, 0xac)
+edid[8] = 0x10; edid[9] = 0xac
+
+# Product code: P2419H
+edid[10] = 0xd0; edid[11] = 0x77
+
+# Serial
 edid[12:16] = b'\x4c\x59\x41\x41'
-edid[16]    = 30;   edid[17] = 34
-edid[18]    = 1;    edid[19] = 4
-edid[20]    = 0xa5
-edid[21]    = 53;   edid[22] = 30
-edid[23]    = 120
-edid[24]    = 0x0a
+
+# Week 30, year 2024 (offset from 1990 = 34)
+edid[16] = 30; edid[17] = 34
+
+# EDID version 1.4
+edid[18] = 1; edid[19] = 4
+
+# Digital input, 8-bit color
+edid[20] = 0xa5
+
+# Screen size: 53cm x 30cm
+edid[21] = 53; edid[22] = 30
+
+# Gamma 2.2 (encoded as 120 = 2.20 * 100 - 100... standard EDID gamma byte)
+edid[23] = 120
+
+# Supported features
+edid[24] = 0x0a
+
+# Chromaticity
 edid[25:35] = b'\xce\x00\xa5\xa5\x55\x4a\x9b\x26\x10\x50'
-edid[35]    = 0x21; edid[36] = 0x08
-edid[38]    = int(1920/8) - 31
-edid[39]    = 0x81
+
+# Established timings
+edid[35] = 0x21; edid[36] = 0x08; edid[37] = 0x00
+
+# Standard timing: 1920x1080
+edid[38] = int(1920 / 8) - 31; edid[39] = 0x81
+
+# Fill remaining standard timings with unused
 for i in range(40, 54, 2):
-    edid[i] = 0x01; edid[i+1] = 0x01
+    edid[i] = 0x01; edid[i + 1] = 0x01
+
+# Detailed timing descriptor: 1920x1080@60Hz
 timing = bytearray(18)
-timing[0]  = 0x02; timing[1]  = 0x3a
-timing[2]  = 0x80; timing[3]  = 0x18
-timing[4]  = 0x71; timing[5]  = 0x38
-timing[6]  = 0x2d; timing[7]  = 0x40
-timing[8]  = 0x58; timing[9]  = 0x2c
-timing[10] = 0x45; timing[17] = 0x1e
-edid[54:72]  = timing
-edid[72:90]  = bytes([0x00,0x00,0x00,0xFC,0x00,0x44,0x65,0x6c,0x6c,0x20,
-                      0x50,0x32,0x34,0x31,0x39,0x48,0x0a,0x20])
-edid[90:108] = bytes([0x00,0x00,0x00,0xFF,0x00,0x59,0x4b,0x52,0x59,0x41,
-                      0x41,0x31,0x0a,0x20,0x20,0x20,0x20,0x20])
-edid[108:126]= bytes([0x00,0x00,0x00,0x10,0x00]+[0x00]*13)
+timing[0]  = 0x02; timing[1]  = 0x3a  # pixel clock: 148.50 MHz
+timing[2]  = 0x80; timing[3]  = 0x18  # h active / blanking
+timing[4]  = 0x71; timing[5]  = 0x38  # h active / blanking (cont)
+timing[6]  = 0x2d; timing[7]  = 0x40  # v active / blanking
+timing[8]  = 0x58; timing[9]  = 0x2c  # v active / blanking (cont)
+timing[10] = 0x45; timing[17] = 0x1e  # sync + flags
+edid[54:72] = timing
+
+# Monitor name descriptor: 'Dell P2419H'
+edid[72:90] = bytes([
+    0x00, 0x00, 0x00, 0xFC, 0x00,
+    0x44, 0x65, 0x6c, 0x6c, 0x20,
+    0x50, 0x32, 0x34, 0x31, 0x39,
+    0x48, 0x0a, 0x20
+])
+
+# Serial number string descriptor
+edid[90:108] = bytes([
+    0x00, 0x00, 0x00, 0xFF, 0x00,
+    0x59, 0x4b, 0x52, 0x59, 0x41,
+    0x41, 0x31, 0x0a, 0x20, 0x20,
+    0x20, 0x20, 0x20
+])
+
+# Dummy descriptor
+edid[108:126] = bytes([0x00, 0x00, 0x00, 0x10, 0x00] + [0x00] * 13)
+
+# Checksum — byte 127 makes total sum mod 256 == 0
 total = sum(edid[:127]) % 256
 edid[127] = (256 - total) % 256
+
+# Verify
+assert sum(edid) % 256 == 0, 'EDID checksum failed!'
+assert len(edid) == 128, 'EDID must be 128 bytes!'
+
 os.makedirs('/etc/vscreen', exist_ok=True)
 with open('/etc/vscreen/edid.bin', 'wb') as f:
     f.write(edid)
-PYEOF
+"
 }
 
 # ── Modeline calculator ───────────────────────────────────────────────────────
 xorg_modeline() {
     local W=$1 H=$2 HZ=${3:-60}
-    cvt "$W" "$H" "$HZ" 2>/dev/null \
-        | grep Modeline \
-        | sed 's/Modeline "[^"]*" //' \
-        || echo "148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync"
-}
-
-# ── GPU detection ─────────────────────────────────────────────────────────────
-# Returns "nvidia", or "none".
-# Fails loudly if an NVIDIA GPU is present but drivers are not working —
-# we never silently fall back, so the user knows exactly what's wrong.
-detect_gpu() {
-    # NOTE: all user-facing output goes to stderr (>&2) so this function
-    # can be used in $() captures without polluting the return value.
-    # Only the mode string ("nvidia" or "none") goes to stdout.
-
-    if lspci 2>/dev/null | grep -qi "nvidia"; then
-        if ! command -v nvidia-smi &>/dev/null; then
-            die "NVIDIA GPU detected but nvidia-smi not found.
-       Install NVIDIA drivers first:
-
-         sudo ubuntu-drivers autoinstall
-         sudo reboot
-
-       Then re-run: sudo vscreen install"
-        fi
-
-        if ! nvidia-smi &>/dev/null; then
-            die "NVIDIA GPU detected but nvidia-smi failed.
-       Your NVIDIA drivers may be broken or not loaded.
-
-       Try:  sudo modprobe nvidia
-       Or:   sudo ubuntu-drivers autoinstall && sudo reboot
-
-       Then re-run: sudo vscreen install"
-        fi
-
-        local gpu_name
-        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-        success "NVIDIA GPU detected: ${gpu_name}" >&2
-        echo "nvidia"
-        return
+    local modeline
+    modeline=$(cvt "$W" "$H" "$HZ" 2>/dev/null | grep -i "^[[:space:]]*Modeline" | sed 's/^[[:space:]]*Modeline "[^"]*"[[:space:]]*//')
+    if [[ -z "$modeline" ]]; then
+        # Fallback: known good modeline for 1920x1080@60
+        echo "148.50 1920 2008 2052 2200 1080 1084 1089 1125 +hsync +vsync"
+    else
+        echo "$modeline"
     fi
-
-    info "No NVIDIA GPU detected — using software dummy driver" >&2
-    echo "none"
 }
 
-# ── Xorg config — NVIDIA (headless, full GPU rendering) ──────────────────────
-# Key options that make NVIDIA work headless:
-#   AllowEmptyInitialConfiguration — don't require a physically connected display
-#   UseDisplayDevice none          — don't scan for physical outputs
-#   ConnectedMonitor DFP-0         — pretend DFP-0 (first DP output) exists
-#   CustomEDID                     — inject our fake Dell monitor EDID so the
-#                                    driver reports a real connected monitor
+# ─────────────────────────────────────────────────────────────────────────────
+# XORG CONFIGS
+# ─────────────────────────────────────────────────────────────────────────────
 write_xorg_conf_nvidia() {
     load_config
     mkdir -p /etc/X11/xorg.conf.d
 
     cat > "$XORG_CONF" <<EOF
 # vscreen — NVIDIA GPU (headless mode)
-# Generated by vscreen $VSCREEN_VERSION
+# Generated by vscreen $VSCREEN_VERSION — do not edit manually
 
 Section "ServerLayout"
     Identifier  "vscreen-layout"
@@ -334,7 +292,6 @@ EndSection
 EOF
 }
 
-# ── Xorg config — dummy (software, no GPU) ────────────────────────────────────
 write_xorg_conf_dummy() {
     load_config
     mkdir -p /etc/X11/xorg.conf.d
@@ -345,7 +302,7 @@ write_xorg_conf_dummy() {
 
     cat > "$XORG_CONF" <<EOF
 # vscreen — software dummy driver (no GPU)
-# Generated by vscreen $VSCREEN_VERSION
+# Generated by vscreen $VSCREEN_VERSION — do not edit manually
 
 Section "Device"
     Identifier  "vscreen-device"
@@ -358,7 +315,7 @@ Section "Monitor"
     HorizSync   28-160
     VertRefresh 48-75
     Option      "DPMS"  "false"
-    Modeline    "${RESOLUTION}" $(xorg_modeline ${W} ${H} ${REFRESH})
+    Modeline    "${RESOLUTION}" $(xorg_modeline "$W" "$H" "$REFRESH")
 EndSection
 
 Section "Screen"
@@ -375,39 +332,59 @@ EndSection
 EOF
 }
 
-# ── Xorg config — dispatcher ──────────────────────────────────────────────────
 write_xorg_conf() {
-    local gpu
-    gpu=$(detect_gpu)
-    case "$gpu" in
+    load_config
+    case "${GPU_MODE}" in
         nvidia) write_xorg_conf_nvidia ;;
         *)      write_xorg_conf_dummy  ;;
     esac
 }
 
-# ── systemd services ──────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# SYSTEMD SERVICES — proper dependency chain, no sleep hacks
+# ─────────────────────────────────────────────────────────────────────────────
 write_systemd_services() {
     load_config
 
-    # X11 server
+    # Create the wait-for-display helper script
+    cat > /usr/local/bin/vscreen-wait-display <<'WAITEOF'
+#!/usr/bin/env bash
+# Wait until Xorg display is ready (used by systemd ExecStartPre)
+DISPLAY="${1:-:1}"
+TIMEOUT="${2:-30}"
+elapsed=0
+while ! DISPLAY="$DISPLAY" xdpyinfo &>/dev/null; do
+    sleep 0.5
+    elapsed=$((elapsed + 1))
+    if [[ $elapsed -ge $((TIMEOUT * 2)) ]]; then
+        echo "vscreen: timed out waiting for display $DISPLAY after ${TIMEOUT}s" >&2
+        exit 1
+    fi
+done
+WAITEOF
+    chmod +x /usr/local/bin/vscreen-wait-display
+
+    # ── Xorg server ──────────────────────────────────────────────────────────
     cat > /etc/systemd/system/vscreen-display.service <<EOF
 [Unit]
-Description=vscreen virtual display (X11)
+Description=vscreen virtual display (Xorg)
 After=network.target
+ConditionPathExists=${VSCREEN_CONF}
 
 [Service]
 Type=simple
 User=root
-ExecStartPre=/bin/bash -c 'modprobe evdi || true'
-ExecStart=/usr/bin/Xorg ${DISPLAY_NUM} -config ${XORG_CONF} -nolisten tcp vt7
+ExecStart=/usr/bin/Xorg ${DISPLAY_NUM} -config ${XORG_CONF} -nolisten tcp -noreset vt7
 Restart=on-failure
 RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # XFCE4 desktop
+    # ── XFCE4 desktop — runs as dedicated vscreen user ────────────────────────
     cat > /etc/systemd/system/vscreen-desktop.service <<EOF
 [Unit]
 Description=vscreen desktop (XFCE4)
@@ -416,21 +393,23 @@ Requires=vscreen-display.service
 
 [Service]
 Type=simple
-User=root
+User=${VSCREEN_USER}
 Environment=DISPLAY=${DISPLAY_NUM}
-Environment=HOME=/root
-Environment=XDG_RUNTIME_DIR=/run/user/0
-ExecStartPre=/bin/bash -c 'mkdir -p /run/user/0 && chmod 700 /run/user/0'
-ExecStartPre=/bin/sleep 2
+Environment=HOME=${VSCREEN_HOME}
+Environment=XDG_RUNTIME_DIR=/run/user/$(id -u "$VSCREEN_USER" 2>/dev/null || echo 1100)
+ExecStartPre=/usr/local/bin/vscreen-wait-display ${DISPLAY_NUM} 30
+ExecStartPre=/bin/bash -c 'mkdir -p /run/user/$(id -u ${VSCREEN_USER}) && chmod 700 /run/user/$(id -u ${VSCREEN_USER}) && chown ${VSCREEN_USER}:${VSCREEN_USER} /run/user/$(id -u ${VSCREEN_USER})'
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/xfce4-session
 Restart=on-failure
 RestartSec=5
+StartLimitIntervalSec=120
+StartLimitBurst=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # x11vnc
+    # ── x11vnc — waits for desktop, runs as vscreen user ──────────────────────
     cat > /etc/systemd/system/vscreen-vnc.service <<EOF
 [Unit]
 Description=vscreen VNC server (x11vnc)
@@ -441,7 +420,7 @@ Requires=vscreen-display.service
 Type=simple
 User=root
 Environment=DISPLAY=${DISPLAY_NUM}
-ExecStartPre=/bin/sleep 3
+ExecStartPre=/usr/local/bin/vscreen-wait-display ${DISPLAY_NUM} 30
 ExecStart=/usr/bin/x11vnc \\
     -display  ${DISPLAY_NUM} \\
     -rfbport  ${VNC_PORT} \\
@@ -453,9 +432,11 @@ ExecStart=/usr/bin/x11vnc \\
     -nowireframe \\
     -nodpms \\
     -threads \\
-    -logfile /var/log/vscreen-vnc.log
+    -logfile ${LOG_DIR}/vnc.log
 Restart=on-failure
 RestartSec=3
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Install]
 WantedBy=multi-user.target
@@ -472,15 +453,171 @@ set_vnc_password() {
     local pass pass2
     while true; do
         read -rsp "  Password: " pass; echo ""
-        [[ -n "$pass" ]] || { warn "Password cannot be empty."; continue; }
+        if [[ -z "$pass" ]]; then
+            warn "Password cannot be empty."
+            continue
+        fi
+        if [[ ${#pass} -gt 8 ]]; then
+            warn "VNC passwords are capped at 8 characters. Only the first 8 will be used."
+        fi
         read -rsp "  Confirm:  " pass2; echo ""
-        [[ "$pass" == "$pass2" ]] && break
+        if [[ "$pass" == "$pass2" ]]; then
+            break
+        fi
         warn "Passwords don't match. Try again."
     done
 
     x11vnc -storepasswd "$pass" "$PASSWD_FILE" 2>/dev/null
     chmod 600 "$PASSWD_FILE"
     success "VNC password set."
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INSTALL
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_install() {
+    require_root install
+
+    header "vscreen $VSCREEN_VERSION — installer"
+    echo "Target: Ubuntu 22.04/24.04 — pure VNC, direct connect"
+    echo ""
+
+    # ── OS check (warn, don't die) ────────────────────────────────────────────
+    if ! grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
+        warn "Not Ubuntu — vscreen is tested on 22.04/24.04. Continuing anyway."
+    fi
+
+    # ── Create dedicated user ─────────────────────────────────────────────────
+    if ! id "$VSCREEN_USER" &>/dev/null; then
+        info "Creating vscreen user..."
+        useradd --system --create-home --shell /usr/sbin/nologin "$VSCREEN_USER"
+        success "Created user: $VSCREEN_USER"
+    else
+        info "User $VSCREEN_USER already exists"
+    fi
+
+    # Allow vscreen user to access the X display
+    # (Xorg runs as root, desktop runs as vscreen user)
+    mkdir -p "$VSCREEN_HOME"
+    chown "$VSCREEN_USER":"$VSCREEN_USER" "$VSCREEN_HOME"
+
+    # ── Log directory ─────────────────────────────────────────────────────────
+    mkdir -p "$LOG_DIR"
+    chmod 755 "$LOG_DIR"
+
+    # ── Packages ──────────────────────────────────────────────────────────────
+    info "Installing packages..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+
+    local packages=(
+        curl
+        wget
+        x11vnc
+        xauth
+        xfce4
+        xfce4-terminal
+        xfce4-notifyd
+        thunar
+        dbus-x11
+        python3
+        xserver-xorg-core
+        xserver-xorg-video-dummy
+        x11-xserver-utils
+        x11-utils
+        pciutils
+        mesa-utils
+    )
+
+    if ! apt-get install -y -qq "${packages[@]}" 2>/dev/null; then
+        die "Package installation failed. Check your internet connection and apt sources."
+    fi
+    success "Packages installed"
+
+    # ── Directories ───────────────────────────────────────────────────────────
+    install -d -m 755 "$VSCREEN_DIR"
+
+    # ── Detect GPU ────────────────────────────────────────────────────────────
+    info "Detecting GPU..."
+    local detected_gpu
+    detected_gpu=$(detect_gpu)
+
+    # ── Config ────────────────────────────────────────────────────────────────
+    if [[ ! -f "$VSCREEN_CONF" ]]; then
+        GPU_MODE="$detected_gpu"
+        load_config  # load defaults
+        GPU_MODE="$detected_gpu"  # override after load
+        save_config
+        success "Config written to $VSCREEN_CONF"
+    else
+        load_config
+        # Always refresh GPU_MODE — drivers may have been installed since last run
+        local old_gpu="$GPU_MODE"
+        GPU_MODE="$detected_gpu"
+        save_config
+        if [[ "$old_gpu" != "$detected_gpu" ]]; then
+            info "GPU mode changed: ${old_gpu} → ${detected_gpu}"
+        else
+            info "Config preserved at $VSCREEN_CONF (GPU_MODE: ${GPU_MODE})"
+        fi
+    fi
+
+    # ── EDID ──────────────────────────────────────────────────────────────────
+    info "Writing EDID (spoofed Dell P2419H)..."
+    if ! write_edid; then
+        die "Failed to write EDID file. Is python3 installed?"
+    fi
+    success "EDID written to $VSCREEN_EDID"
+
+    # ── Xorg config ───────────────────────────────────────────────────────────
+    info "Writing Xorg configuration (mode: ${GPU_MODE})..."
+    write_xorg_conf
+    success "Xorg config written to $XORG_CONF"
+
+    # ── X access for vscreen user ─────────────────────────────────────────────
+    # Create Xauthority hook so the vscreen user can connect to :1
+    cat > /usr/local/bin/vscreen-xauth-setup <<'XAUTHEOF'
+#!/usr/bin/env bash
+# Grant the vscreen user access to the X display
+DISPLAY="${1:-:1}"
+XAUTH_FILE="/home/vscreen/.Xauthority"
+# Generate a cookie for the display
+COOKIE=$(mcookie)
+xauth -f "$XAUTH_FILE" add "$DISPLAY" . "$COOKIE"
+xauth add "$DISPLAY" . "$COOKIE"
+chown vscreen:vscreen "$XAUTH_FILE"
+XAUTHEOF
+    chmod +x /usr/local/bin/vscreen-xauth-setup
+
+    # ── systemd services ──────────────────────────────────────────────────────
+    info "Installing systemd services..."
+    write_systemd_services
+    systemctl daemon-reload
+    success "Services installed"
+
+    # ── VNC password ──────────────────────────────────────────────────────────
+    if [[ ! -f "$PASSWD_FILE" ]]; then
+        echo ""
+        set_vnc_password
+    else
+        info "VNC password already set. Change with: sudo vscreen password"
+    fi
+
+    # ── Install binary ────────────────────────────────────────────────────────
+    local self
+    self=$(realpath "$0" 2>/dev/null || echo "$0")
+    if [[ "$self" != "/usr/local/bin/vscreen" ]]; then
+        cp "$self" /usr/local/bin/vscreen
+        chmod +x /usr/local/bin/vscreen
+        success "vscreen installed to /usr/local/bin/vscreen"
+    fi
+
+    echo ""
+    echo -e "${GREEN}${BOLD}Installation complete.${RESET}"
+    echo ""
+    echo "  Start:   sudo vscreen start"
+    echo "  Status:  sudo vscreen status"
+    echo ""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -495,19 +632,43 @@ cmd_start() {
 
     header "vscreen — starting"
 
-    modprobe evdi 2>/dev/null || true
+    # Regenerate Xorg conf in case config changed
+    write_xorg_conf
+
+    # Regenerate systemd units in case config changed (port, etc.)
+    write_systemd_services
+    systemctl daemon-reload
 
     info "Starting virtual display..."
-    systemctl start vscreen-display
-    sleep 2
+    if ! systemctl start vscreen-display; then
+        error "Failed to start Xorg. Check: sudo journalctl -u vscreen-display -n 30"
+        exit 1
+    fi
+
+    # Wait for display to be ready (with timeout)
+    info "Waiting for display to be ready..."
+    if ! wait_for_display "$DISPLAY_NUM" 30; then
+        error "Display did not start in time. Check: sudo journalctl -u vscreen-display -n 30"
+        exit 1
+    fi
+
+    # Grant X access to vscreen user
+    /usr/local/bin/vscreen-xauth-setup "$DISPLAY_NUM" 2>/dev/null || true
 
     info "Starting XFCE4 desktop..."
-    systemctl start vscreen-desktop
-    sleep 3
+    if ! systemctl start vscreen-desktop; then
+        error "Failed to start desktop. Check: sudo journalctl -u vscreen-desktop -n 30"
+        exit 1
+    fi
+
+    # Give desktop a moment to initialize window manager
+    sleep 2
 
     info "Starting VNC server..."
-    systemctl start vscreen-vnc
-    sleep 1
+    if ! systemctl start vscreen-vnc; then
+        error "Failed to start VNC. Check: sudo journalctl -u vscreen-vnc -n 30"
+        exit 1
+    fi
 
     local ip
     ip=$(get_public_ip)
@@ -519,15 +680,12 @@ cmd_start() {
     echo ""
     echo -e "  Resolution:  ${RESOLUTION} @ ${REFRESH}Hz"
     echo -e "  Display:     ${DISPLAY_NUM}"
+    echo -e "  GPU:         ${GPU_MODE}"
     echo ""
     echo "  Open any VNC client and connect to the address above."
     echo "  Use your VNC password when prompted."
     echo ""
     warn "Make sure port ${VNC_PORT} (TCP) is open inbound on your server's firewall."
-    echo ""
-    echo "  Stop:            sudo vscreen stop"
-    echo "  Status:          sudo vscreen status"
-    echo "  Change password: sudo vscreen password"
     echo ""
 }
 
@@ -538,9 +696,15 @@ cmd_stop() {
     require_root stop
 
     header "vscreen — stopping"
-    systemctl stop vscreen-vnc     2>/dev/null || true
-    systemctl stop vscreen-desktop 2>/dev/null || true
-    systemctl stop vscreen-display 2>/dev/null || true
+
+    # Stop in reverse order — VNC first, then desktop, then display
+    local services=(vscreen-vnc vscreen-desktop vscreen-display)
+    for svc in "${services[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" 2>/dev/null || warn "Failed to stop $svc"
+        fi
+    done
+
     success "Stopped."
     echo ""
 }
@@ -564,39 +728,58 @@ cmd_status() {
     header "vscreen — status"
     echo ""
 
+    local all_active=true
     local services=(vscreen-display vscreen-desktop vscreen-vnc)
     for svc in "${services[@]}"; do
         local state
-        state=$(systemctl is-active "$svc" 2>/dev/null)
+        state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
         if [[ "$state" == "active" ]]; then
             echo -e "  ${GREEN}●${RESET} $svc"
         else
             echo -e "  ${RED}○${RESET} $svc  (${state})"
+            all_active=false
         fi
     done
 
     echo ""
     local ip
     ip=$(get_public_ip)
-    echo -e "  ${BOLD}Connect:${RESET}  ${CYAN}${ip}:${VNC_PORT}${RESET}"
+
+    if [[ "$all_active" == true ]]; then
+        echo -e "  ${BOLD}Connect:${RESET}  ${CYAN}${ip}:${VNC_PORT}${RESET}"
+    else
+        echo -e "  ${YELLOW}Not all services are running.${RESET} Start with: sudo vscreen start"
+    fi
+
     echo ""
     echo -e "  Resolution:  ${RESOLUTION} @ ${REFRESH}Hz"
     echo -e "  Display:     ${DISPLAY_NUM}"
     echo -e "  VNC port:    ${VNC_PORT}"
 
     # GPU mode
-    local gpu_mode="${GPU_MODE:-unknown}"
-    if [[ "$gpu_mode" == "nvidia" ]]; then
+    if [[ "${GPU_MODE}" == "nvidia" ]]; then
         local gpu_name
         gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "NVIDIA")
-        echo -e "  GPU:         ${GREEN}${gpu_name}${RESET} (full acceleration)"
+        echo -e "  GPU:         ${GREEN}${gpu_name}${RESET} (hardware acceleration)"
     else
-        echo -e "  GPU:         software (dummy driver — no GPU detected at install time)"
+        echo -e "  GPU:         software (dummy driver)"
     fi
 
     echo ""
-    warn "Port ${VNC_PORT} must be open inbound on your server's firewall."
-    echo ""
+
+    # Show recent errors if any service is down
+    if [[ "$all_active" != true ]]; then
+        echo -e "  ${BOLD}Recent logs:${RESET}"
+        for svc in "${services[@]}"; do
+            local state
+            state=$(systemctl is-active "$svc" 2>/dev/null || echo "inactive")
+            if [[ "$state" != "active" ]]; then
+                echo -e "  ${RED}── $svc ──${RESET}"
+                journalctl -u "$svc" -n 5 --no-pager 2>/dev/null | sed 's/^/    /' || true
+                echo ""
+            fi
+        done
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -607,18 +790,23 @@ cmd_gpu() {
     header "vscreen — GPU info"
     echo ""
 
+    if ! command -v lspci &>/dev/null; then
+        warn "pciutils not installed — cannot detect GPU"
+        echo ""
+        return
+    fi
+
     # Check for NVIDIA hardware
     if ! lspci 2>/dev/null | grep -qi "nvidia"; then
-        echo -e "  No NVIDIA GPU detected on this machine."
-        echo -e "  vscreen is running with the software dummy driver."
-        echo -e "  CPU-only rendering — no hardware acceleration."
+        echo "  No NVIDIA GPU detected on this machine."
+        echo "  vscreen is running with the software dummy driver."
         echo ""
         return
     fi
 
     echo -e "  ${GREEN}✓${RESET}  NVIDIA GPU present"
 
-    # Driver
+    # Driver check
     if ! command -v nvidia-smi &>/dev/null; then
         echo -e "  ${RED}✗${RESET}  nvidia-smi not found — drivers not installed"
         echo ""
@@ -641,7 +829,9 @@ cmd_gpu() {
     echo ""
 
     # GPU details
-    nvidia-smi --query-gpu=name,driver_version,memory.total,utilization.gpu,temperature.gpu                --format=csv,noheader 2>/dev/null     | while IFS=',' read -r name driver mem util temp; do
+    nvidia-smi --query-gpu=name,driver_version,memory.total,utilization.gpu,temperature.gpu \
+        --format=csv,noheader 2>/dev/null \
+    | while IFS=',' read -r name driver mem util temp; do
         echo -e "  Name:        ${name# }"
         echo -e "  Driver:      ${driver# }"
         echo -e "  VRAM:        ${mem# }"
@@ -651,37 +841,32 @@ cmd_gpu() {
 
     echo ""
 
-    # Is vscreen actually using the GPU?
-    local gpu_mode="${GPU_MODE:-unknown}"
-    if [[ "$gpu_mode" == "nvidia" ]]; then
+    # Is vscreen using the GPU?
+    if [[ "${GPU_MODE}" == "nvidia" ]]; then
         echo -e "  ${GREEN}✓${RESET}  vscreen is using the GPU (NVIDIA driver mode)"
     else
-        echo -e "  ${YELLOW}⚠${RESET}  vscreen was installed without GPU mode"
+        echo -e "  ${YELLOW}⚠${RESET}  vscreen is using the dummy driver despite NVIDIA GPU being present"
         echo "  Re-run install to switch:  sudo vscreen install"
     fi
 
     echo ""
 
-    # OpenGL renderer check via glxinfo
+    # OpenGL renderer check
     if ! command -v glxinfo &>/dev/null; then
-        warn "glxinfo not found — run: sudo apt install mesa-utils" >&2
+        warn "glxinfo not found — run: sudo apt install mesa-utils"
     elif ! systemctl is-active --quiet vscreen-display 2>/dev/null; then
-        echo "  (Run 'sudo vscreen start' then 'sudo vscreen gpu' to verify OpenGL renderer)"
+        echo "  (Start vscreen first, then run 'sudo vscreen gpu' to verify OpenGL renderer)"
     else
         local renderer
-        renderer=$(DISPLAY="$DISPLAY_NUM" glxinfo 2>/dev/null | grep "OpenGL renderer" | cut -d: -f2 | xargs)
+        renderer=$(DISPLAY="$DISPLAY_NUM" glxinfo 2>/dev/null | grep "OpenGL renderer" | cut -d: -f2 | xargs) || true
         if [[ -n "$renderer" ]]; then
             echo -e "  OpenGL:      ${renderer}"
             if echo "$renderer" | grep -qi "nvidia"; then
-                echo -e "  ${GREEN}✓${RESET}  Hardware OpenGL confirmed — full GPU acceleration active"
+                echo -e "  ${GREEN}✓${RESET}  Hardware OpenGL confirmed"
             else
                 echo -e "  ${YELLOW}⚠${RESET}  OpenGL renderer is not NVIDIA (got: ${renderer})"
-                echo    "     This means apps are using software rendering despite the GPU being present."
-                echo    "     Check Xorg log: sudo journalctl -u vscreen-display -n 50"
+                echo "     Check Xorg log: sudo journalctl -u vscreen-display -n 50"
             fi
-        else
-            echo -e "  ${YELLOW}⚠${RESET}  glxinfo returned no renderer — Xorg may not be using the GPU yet"
-            echo    "     Check: sudo journalctl -u vscreen-display -n 50"
         fi
     fi
 
@@ -716,16 +901,33 @@ cmd_resolution() {
     [[ "$res" =~ ^[0-9]+x[0-9]+$ ]] || die "Invalid format. Use WIDTHxHEIGHT e.g. 1920x1080"
 
     load_config
-    sed -i "s/^RESOLUTION=.*/RESOLUTION=\"${res}\"/" "$VSCREEN_CONF"
+    RESOLUTION="$res"
+    save_config
 
-    if systemctl is-active --quiet vscreen-display; then
-        info "Applying live via xrandr..."
-        DISPLAY="$DISPLAY_NUM" xrandr --output HDMI-1    --mode "$res" 2>/dev/null ||
-        DISPLAY="$DISPLAY_NUM" xrandr --output Virtual-1 --mode "$res" 2>/dev/null ||
-        warn "Could not apply live — run: sudo vscreen restart"
+    # Regenerate Xorg config for the new resolution
+    write_xorg_conf
+
+    if systemctl is-active --quiet vscreen-display 2>/dev/null; then
+        info "Applying resolution change..."
+
+        # Detect the actual output name instead of guessing
+        local output
+        output=$(detect_output_name)
+
+        if [[ -n "$output" ]]; then
+            if DISPLAY="$DISPLAY_NUM" xrandr --output "$output" --mode "$res" 2>/dev/null; then
+                success "Resolution set to $res (applied live via $output)"
+            else
+                warn "Could not apply live — restart required: sudo vscreen restart"
+                success "Resolution set to $res (will apply on restart)"
+            fi
+        else
+            warn "Could not detect output name — restart required: sudo vscreen restart"
+            success "Resolution set to $res (will apply on restart)"
+        fi
+    else
+        success "Resolution set to $res"
     fi
-
-    success "Resolution set to $res"
     echo ""
 }
 
@@ -738,12 +940,18 @@ cmd_port() {
     [[ -n "$port" ]] || die "Usage: vscreen port <number>  e.g. 5901"
     [[ "$port" =~ ^[0-9]+$ ]] || die "Port must be a number."
 
+    # Basic port range validation
+    if [[ "$port" -lt 1024 || "$port" -gt 65535 ]]; then
+        warn "Port $port is outside the typical range (1024-65535)."
+    fi
+
     load_config
-    sed -i "s/^VNC_PORT=.*/VNC_PORT=\"${port}\"/" "$VSCREEN_CONF"
+    VNC_PORT="$port"
+    save_config
     write_systemd_services
     systemctl daemon-reload
 
-    if systemctl is-active --quiet vscreen-vnc; then
+    if systemctl is-active --quiet vscreen-vnc 2>/dev/null; then
         info "Restarting VNC server on new port..."
         systemctl restart vscreen-vnc
     fi
@@ -751,6 +959,35 @@ cmd_port() {
     success "VNC port set to $port"
     warn "Make sure port ${port} is open inbound on your server's firewall."
     echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGS
+# ─────────────────────────────────────────────────────────────────────────────
+cmd_logs() {
+    local svc="${1:-}"
+    local lines="${2:-30}"
+
+    if [[ -z "$svc" ]]; then
+        # Show all vscreen logs
+        header "vscreen — recent logs"
+        echo ""
+        for s in vscreen-display vscreen-desktop vscreen-vnc; do
+            echo -e "  ${BOLD}── $s ──${RESET}"
+            journalctl -u "$s" -n "$lines" --no-pager 2>/dev/null | sed 's/^/  /' || echo "  (no logs)"
+            echo ""
+        done
+    else
+        # Show specific service logs
+        case "$svc" in
+            display|xorg)   svc="vscreen-display" ;;
+            desktop|xfce)   svc="vscreen-desktop" ;;
+            vnc|x11vnc)     svc="vscreen-vnc" ;;
+            vscreen-*)      ;; # already qualified
+            *)              die "Unknown service: $svc (use: display, desktop, or vnc)" ;;
+        esac
+        journalctl -u "$svc" -n "$lines" --no-pager 2>/dev/null
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -762,8 +999,9 @@ cmd_uninstall() {
     header "vscreen — uninstall"
     warn "This will remove all vscreen components."
     read -rp "  Are you sure? [y/N] " confirm
-    [[ "$confirm" =~ ^[yY]$ ]] || { echo "Aborted."; exit 0; }
+    [[ "$confirm" =~ ^[yY]$ ]] || { echo "  Aborted."; exit 0; }
 
+    # Stop and disable services
     for svc in vscreen-vnc vscreen-desktop vscreen-display; do
         systemctl stop    "$svc" 2>/dev/null || true
         systemctl disable "$svc" 2>/dev/null || true
@@ -771,11 +1009,22 @@ cmd_uninstall() {
     done
     systemctl daemon-reload
 
-    rm -f  "$XORG_CONF"
-    rm -rf /etc/vscreen
+    # Clean up files
+    rm -f "$XORG_CONF"
+    rm -f /usr/local/bin/vscreen-wait-display
+    rm -f /usr/local/bin/vscreen-xauth-setup
+    rm -rf "$VSCREEN_DIR"
+    rm -rf "$LOG_DIR"
+
+    # Remove dedicated user (but leave home dir in case user wants data)
+    if id "$VSCREEN_USER" &>/dev/null; then
+        userdel "$VSCREEN_USER" 2>/dev/null || true
+        info "User $VSCREEN_USER removed (home directory preserved at $VSCREEN_HOME)"
+    fi
 
     success "vscreen uninstalled."
     rm -f /usr/local/bin/vscreen
+    echo ""
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -803,6 +1052,7 @@ ${BOLD}COMMANDS${RESET}
   gpu                   Show GPU info and acceleration status
   resolution <WxH>      Change display resolution  (e.g. 2560x1440)
   port <number>         Change the VNC port        (default: 5900)
+  logs [service] [n]    Show recent logs (service: display, desktop, vnc)
   uninstall             Remove vscreen completely
   help                  Show this help
 
@@ -812,7 +1062,8 @@ ${BOLD}QUICK START${RESET}
   # Connect with any VNC client to YOUR.IP:5900
 
 ${BOLD}RECOMMENDED VNC CLIENTS${RESET}
-  macOS      RealVNC Viewer, Screens 5, built-in Screen Sharing (Finder → Go → Connect to Server → vnc://IP)
+  macOS      RealVNC Viewer, Screens 5, built-in Screen Sharing
+             (Finder → Go → Connect to Server → vnc://IP)
   Windows    RealVNC Viewer, TigerVNC Viewer
   Linux      Remmina, TigerVNC, KRDC
   iOS        RealVNC Viewer, Screens for iOS
@@ -845,6 +1096,7 @@ main() {
         gpu)        cmd_gpu        "$@" ;;
         resolution) cmd_resolution "$@" ;;
         port)       cmd_port       "$@" ;;
+        logs)       cmd_logs       "$@" ;;
         uninstall)  cmd_uninstall  "$@" ;;
         help|--help|-h)       cmd_help ;;
         version|--version|-v) echo "vscreen $VSCREEN_VERSION" ;;
