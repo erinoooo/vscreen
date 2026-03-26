@@ -601,6 +601,7 @@ cmd_status() {
 # GPU
 # ─────────────────────────────────────────────────────────────────────────────
 cmd_gpu() {
+    load_config
     header "vscreen — GPU info"
     echo ""
 
