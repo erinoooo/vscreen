@@ -96,11 +96,11 @@ cmd_install() {
     install -d -m 755 /etc/vscreen
 
     # ── Default config ────────────────────────────────────────────────────────
-    if [[ ! -f "$VSCREEN_CONF" ]]; then
-        # Detect GPU now so we can store the mode in config
-        local detected_gpu
-        detected_gpu=$(detect_gpu)
+    # Detect GPU first — needed whether or not config already exists
+    local detected_gpu
+    detected_gpu=$(detect_gpu)
 
+    if [[ ! -f "$VSCREEN_CONF" ]]; then
         cat > "$VSCREEN_CONF" <<CONFEOF
 # vscreen configuration
 RESOLUTION="1920x1080"
@@ -110,7 +110,14 @@ GPU_MODE="${detected_gpu}"
 CONFEOF
         success "Config written to $VSCREEN_CONF"
     else
-        info "Config exists at $VSCREEN_CONF — not overwriting"
+        # Config exists — preserve user settings but always refresh GPU_MODE
+        # in case drivers were installed since last run
+        if grep -q "^GPU_MODE=" "$VSCREEN_CONF"; then
+            sed -i "s/^GPU_MODE=.*/GPU_MODE="${detected_gpu}"/" "$VSCREEN_CONF"
+        else
+            echo "GPU_MODE="${detected_gpu}"" >> "$VSCREEN_CONF"
+        fi
+        info "Config exists at $VSCREEN_CONF — preserved (GPU_MODE updated to: ${detected_gpu})"
     fi
 
     # ── EDID ──────────────────────────────────────────────────────────────────
@@ -238,8 +245,11 @@ xorg_modeline() {
 # Fails loudly if an NVIDIA GPU is present but drivers are not working —
 # we never silently fall back, so the user knows exactly what's wrong.
 detect_gpu() {
+    # NOTE: all user-facing output goes to stderr (>&2) so this function
+    # can be used in $() captures without polluting the return value.
+    # Only the mode string ("nvidia" or "none") goes to stdout.
+
     if lspci 2>/dev/null | grep -qi "nvidia"; then
-        # GPU is present — now check if the driver is actually working
         if ! command -v nvidia-smi &>/dev/null; then
             die "NVIDIA GPU detected but nvidia-smi not found.
        Install NVIDIA drivers first:
@@ -262,13 +272,12 @@ detect_gpu() {
 
         local gpu_name
         gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
-        success "NVIDIA GPU detected: ${gpu_name}"
+        success "NVIDIA GPU detected: ${gpu_name}" >&2
         echo "nvidia"
         return
     fi
 
-    # No NVIDIA GPU — use software dummy driver
-    info "No NVIDIA GPU detected — using software dummy driver"
+    info "No NVIDIA GPU detected — using software dummy driver" >&2
     echo "none"
 }
 
