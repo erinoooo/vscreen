@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# vscreen-check — pre-flight checks for vscreen
+# Run before installing if you want to know what's missing ahead of time.
+# Usage: bash vscreen-check
+
+set -euo pipefail
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'
+
+ok()   { echo -e "  ${GREEN}✓${RESET}  $*"; }
+warn() { echo -e "  ${YELLOW}⚠${RESET}  $*"; }
+fail() { echo -e "  ${RED}✗${RESET}  $*"; FAILED=1; }
+section() { echo ""; echo -e "${BOLD}$*${RESET}"; }
+
+FAILED=0
+WARNINGS=0
+
+echo ""
+echo -e "${BOLD}vscreen pre-flight check${RESET}"
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+section "OS"
+if grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
+    ver=$(grep VERSION_ID /etc/os-release | cut -d'"' -f2)
+    if [[ "$ver" == "22.04" || "$ver" == "24.04" ]]; then
+        ok "Ubuntu $ver (supported)"
+    else
+        warn "Ubuntu $ver — vscreen is tested on 22.04 and 24.04"
+        (( WARNINGS++ )) || true
+    fi
+else
+    warn "Not Ubuntu — vscreen may still work but is untested on this distro"
+    (( WARNINGS++ )) || true
+fi
+
+if [[ $EUID -eq 0 ]]; then
+    ok "Running as root"
+else
+    warn "Not root — install and start will need sudo"
+    (( WARNINGS++ )) || true
+fi
+
+# ── Kernel ────────────────────────────────────────────────────────────────────
+section "Kernel"
+kernel=$(uname -r)
+ok "Kernel $kernel"
+
+if dpkg -l "linux-headers-${kernel}" &>/dev/null 2>&1; then
+    ok "Kernel headers installed"
+else
+    warn "linux-headers-${kernel} not found — vscreen install will fetch them"
+    (( WARNINGS++ )) || true
+fi
+
+if command -v dkms &>/dev/null; then
+    ok "DKMS available"
+else
+    warn "DKMS not found — vscreen install will install it"
+    (( WARNINGS++ )) || true
+fi
+
+# ── evdi ──────────────────────────────────────────────────────────────────────
+section "evdi"
+if lsmod | grep -q "^evdi" 2>/dev/null; then
+    ok "evdi loaded"
+elif modinfo evdi &>/dev/null 2>&1; then
+    ok "evdi installed (not loaded)"
+else
+    warn "evdi not found — vscreen install will build and install it via DKMS"
+    (( WARNINGS++ )) || true
+fi
+
+# ── Display stack ─────────────────────────────────────────────────────────────
+section "Display"
+if command -v Xorg &>/dev/null; then
+    ok "Xorg installed"
+else
+    fail "Xorg not found — run: sudo apt install xserver-xorg-core"
+fi
+
+if dpkg -l xserver-xorg-video-dummy &>/dev/null 2>&1; then
+    ok "xserver-xorg-video-dummy installed"
+else
+    warn "xserver-xorg-video-dummy not found — vscreen install will install it"
+    (( WARNINGS++ )) || true
+fi
+
+if command -v cvt &>/dev/null; then
+    ok "cvt available (modeline generation)"
+else
+    warn "cvt not found — vscreen install will install x11-xserver-utils"
+    (( WARNINGS++ )) || true
+fi
+
+if command -v xfce4-session &>/dev/null; then
+    ok "XFCE4 installed"
+else
+    warn "XFCE4 not found — vscreen install will install it (~200MB)"
+    (( WARNINGS++ )) || true
+fi
+
+# ── VNC ───────────────────────────────────────────────────────────────────────
+section "VNC"
+if command -v x11vnc &>/dev/null; then
+    ok "x11vnc installed"
+else
+    warn "x11vnc not found — vscreen install will install it"
+    (( WARNINGS++ )) || true
+fi
+
+vnc_port="${VNC_PORT:-5900}"
+if command -v ss &>/dev/null; then
+    if ss -tlnp 2>/dev/null | grep -q ":${vnc_port} "; then
+        warn "Port ${vnc_port} already in use — something else may be running a VNC server"
+        (( WARNINGS++ )) || true
+    else
+        ok "Port ${vnc_port} is free"
+    fi
+fi
+
+if [[ -f /etc/vscreen/passwd ]]; then
+    ok "VNC password already set"
+else
+    warn "No VNC password set yet — vscreen install will prompt you to set one"
+    (( WARNINGS++ )) || true
+fi
+
+# ── Network ───────────────────────────────────────────────────────────────────
+section "Network"
+if command -v curl &>/dev/null; then
+    ip=$(curl -s --max-time 4 https://api.ipify.org 2>/dev/null || \
+         curl -s --max-time 4 https://ifconfig.me 2>/dev/null   || \
+         echo "")
+    if [[ -n "$ip" ]]; then
+        ok "Public IP: ${ip}"
+        echo ""
+        echo -e "  After starting vscreen, connect your VNC client to:  ${BOLD}${ip}:${vnc_port}${RESET}"
+        echo -e "  Make sure port ${vnc_port} is open inbound on your server's firewall."
+    else
+        warn "Could not detect public IP — no outbound internet access?"
+        (( WARNINGS++ )) || true
+    fi
+else
+    warn "curl not found — cannot detect public IP"
+    (( WARNINGS++ )) || true
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo "────────────────────────────────────────"
+
+if [[ $FAILED -gt 0 ]]; then
+    echo -e "${RED}${BOLD}$FAILED issue(s) need fixing before install.${RESET}"
+    echo "  Resolve the ✗ items above, then run:"
+    echo ""
+    echo "  curl -fsSL https://raw.githubusercontent.com/erinoooo/vscreen/main/install.sh | sudo bash"
+elif [[ $WARNINGS -gt 0 ]]; then
+    echo -e "${YELLOW}${BOLD}Ready to install${RESET} ($WARNINGS thing(s) will be handled by the installer)"
+    echo ""
+    echo "  curl -fsSL https://raw.githubusercontent.com/erinoooo/vscreen/main/install.sh | sudo bash"
+else
+    echo -e "${GREEN}${BOLD}All good — ready to install.${RESET}"
+    echo ""
+    echo "  curl -fsSL https://raw.githubusercontent.com/erinoooo/vscreen/main/install.sh | sudo bash"
+fi
+echo ""
