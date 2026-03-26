@@ -128,9 +128,3 @@ vscreen uses the `dummy` Xorg driver with a spoofed EDID that tells the system a
 | EDID | None | Spoofed (Dell P2419H) |
 | Apps detect headless | Sometimes | No |
 | Setup | Manual | One command |
-
----
-
-## License
-
-MIT
