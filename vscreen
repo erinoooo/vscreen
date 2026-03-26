@@ -35,6 +35,7 @@ load_config() {
     RESOLUTION="${RESOLUTION:-1920x1080}"
     REFRESH="${REFRESH:-60}"
     VNC_PORT="${VNC_PORT:-5900}"
+    GPU_MODE="${GPU_MODE:-none}"
 }
 
 # ── Get public IP ─────────────────────────────────────────────────────────────
@@ -113,9 +114,9 @@ CONFEOF
         # Config exists — preserve user settings but always refresh GPU_MODE
         # in case drivers were installed since last run
         if grep -q "^GPU_MODE=" "$VSCREEN_CONF"; then
-            sed -i "s/^GPU_MODE=.*/GPU_MODE="${detected_gpu}"/" "$VSCREEN_CONF"
+            sed -i "s/^GPU_MODE=.*/GPU_MODE=\"${detected_gpu}\"/" "$VSCREEN_CONF"
         else
-            echo "GPU_MODE="${detected_gpu}"" >> "$VSCREEN_CONF"
+            echo "GPU_MODE=\"${detected_gpu}\"" >> "$VSCREEN_CONF"
         fi
         info "Config exists at $VSCREEN_CONF — preserved (GPU_MODE updated to: ${detected_gpu})"
     fi
